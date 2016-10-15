@@ -206,6 +206,9 @@ IB_DESIGNABLE
  */
 @property (nonatomic, assign) IBInspectable CGFloat firstLineIndent;
 
+// 是否保持缩紧
+@property (nonatomic, assign) BOOL keepHeadIntent;
+
 /**
  The space in points added between lines within the paragraph. This value is always nonnegative and is 0.0 by default.
  */

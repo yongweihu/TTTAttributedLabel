@@ -741,6 +741,10 @@ static inline CGSize CTFramesetterSuggestFrameSizeForAttributedStringWithConstra
         // Apply penOffset using flushFactor for horizontal alignment to set lineOrigin since this is the horizontal offset from drawFramesetter
         CGFloat flushFactor = TTTFlushFactorForTextAlignment(self.textAlignment);
         CGFloat penOffset = (CGFloat)CTLineGetPenOffsetForFlush(line, flushFactor, textRect.size.width);
+        if (self.keepHeadIntent) {
+            penOffset += lineOrigin.x;
+        }
+        
         lineOrigin.x = penOffset;
 
         // Check if we've already passed the line
@@ -807,7 +811,8 @@ static inline CGSize CTFramesetterSuggestFrameSizeForAttributedStringWithConstra
         CTLineRef line = CFArrayGetValueAtIndex(lines, lineIndex);
 
         CGFloat descent = 0.0f;
-        CTLineGetTypographicBounds((CTLineRef)line, NULL, &descent, NULL);
+        CGFloat ascent = 0.0f;
+        CTLineGetTypographicBounds((CTLineRef)line, &ascent, &descent, NULL);
 
         // Adjust pen offset for flush depending on text alignment
         CGFloat flushFactor = TTTFlushFactorForTextAlignment(self.textAlignment);
@@ -894,14 +899,10 @@ static inline CGSize CTFramesetterSuggestFrameSizeForAttributedStringWithConstra
                 CFRelease(truncationLine);
                 CFRelease(truncationToken);
             } else {
-                CGFloat penOffset = (CGFloat)CTLineGetPenOffsetForFlush(line, flushFactor, rect.size.width);
-                CGContextSetTextPosition(c, penOffset, lineOrigin.y - descent - self.font.descender);
-                CTLineDraw(line, c);
+                [self drawAttributedLine:line withOrigin:lineOrigin withFontDescent:descent ascent:ascent inRect:rect context:c];
             }
         } else {
-            CGFloat penOffset = (CGFloat)CTLineGetPenOffsetForFlush(line, flushFactor, rect.size.width);
-            CGContextSetTextPosition(c, penOffset, lineOrigin.y - descent - self.font.descender);
-            CTLineDraw(line, c);
+            [self drawAttributedLine:line withOrigin:lineOrigin withFontDescent:descent ascent:ascent inRect:rect context:c];
         }
     }
 
@@ -909,6 +910,41 @@ static inline CGSize CTFramesetterSuggestFrameSizeForAttributedStringWithConstra
 
     CFRelease(frame);
     CGPathRelease(path);
+}
+
+- (void)drawAttributedLine:(CTLineRef)line
+                withOrigin:(CGPoint)lineOrigin
+           withFontDescent:(CGFloat)lineDescent
+                    ascent:(CGFloat)lineAscent
+                    inRect:(CGRect)rect
+                   context:(CGContextRef)c
+{
+    CGFloat flushFactor = TTTFlushFactorForTextAlignment(self.textAlignment);
+    CGFloat penOffset = (CGFloat)CTLineGetPenOffsetForFlush(line, flushFactor, rect.size.width);
+    if (self.keepHeadIntent) {
+        penOffset += lineOrigin.x;
+    }
+    
+    CGFloat baseOffset = lineOrigin.y;
+    CFArrayRef glyphRuns = CTLineGetGlyphRuns(line);
+    CFIndex runCount = CFArrayGetCount(glyphRuns);
+    CFRange allRange = CFRangeMake(0, 0);
+    
+    for (CFIndex runIndex = 0; runIndex < runCount; runIndex++)
+    {
+        CTRunRef run = CFArrayGetValueAtIndex(glyphRuns, runIndex);
+        CGFloat runAscent = 0.0f;
+        CGFloat runDescent = 0.0f;
+        
+        CTRunGetTypographicBounds(run, CFRangeMake(0, 0), &runAscent, &runDescent, NULL);
+        NSDictionary *attributes = (__bridge NSDictionary *)CTRunGetAttributes(run);
+        CGFloat offset = baseOffset;
+        NSNumber *newBaseline = (NSNumber*)[attributes objectForKey:NSBaselineOffsetAttributeName];
+        if (newBaseline)
+            offset += [newBaseline doubleValue];
+        CGContextSetTextPosition(c, penOffset, offset);
+        CTRunDraw(run, c, allRange);
+    }
 }
 
 - (void)drawBackground:(CTFrameRef)frame
@@ -923,7 +959,10 @@ static inline CGSize CTFramesetterSuggestFrameSizeForAttributedStringWithConstra
     for (id line in lines) {
         CGFloat ascent = 0.0f, descent = 0.0f, leading = 0.0f;
         CGFloat width = (CGFloat)CTLineGetTypographicBounds((__bridge CTLineRef)line, &ascent, &descent, &leading) ;
-
+        
+        // 用于记录当前行的第一次需要显示背景的run高度和originY，保证同行背景高度一致
+        CGFloat backgroundHeight = 0.;
+        CGFloat backgroundOriginY = 0.;
         for (id glyphRun in (__bridge NSArray *)CTLineGetGlyphRuns((__bridge CTLineRef)line)) {
             NSDictionary *attributes = (__bridge NSDictionary *)CTRunGetAttributes((__bridge CTRunRef) glyphRun);
             CGColorRef strokeColor = CGColorRefFromColor([attributes objectForKey:kTTTBackgroundStrokeColorAttributeName]);
@@ -931,14 +970,20 @@ static inline CGSize CTFramesetterSuggestFrameSizeForAttributedStringWithConstra
             UIEdgeInsets fillPadding = [[attributes objectForKey:kTTTBackgroundFillPaddingAttributeName] UIEdgeInsetsValue];
             CGFloat cornerRadius = [[attributes objectForKey:kTTTBackgroundCornerRadiusAttributeName] floatValue];
             CGFloat lineWidth = [[attributes objectForKey:kTTTBackgroundLineWidthAttributeName] floatValue];
-
+            CGFloat baseLineOffset = [[attributes objectForKey:NSBaselineOffsetAttributeName] floatValue];
+            
             if (strokeColor || fillColor) {
                 CGRect runBounds = CGRectZero;
                 CGFloat runAscent = 0.0f;
                 CGFloat runDescent = 0.0f;
 
                 runBounds.size.width = (CGFloat)CTRunGetTypographicBounds((__bridge CTRunRef)glyphRun, CFRangeMake(0, 0), &runAscent, &runDescent, NULL) + fillPadding.left + fillPadding.right;
-                runBounds.size.height = runAscent + runDescent + fillPadding.top + fillPadding.bottom;
+                if (backgroundHeight == 0.) {
+                    runBounds.size.height = runAscent + runDescent + fillPadding.top + fillPadding.bottom;
+                    backgroundHeight = runBounds.size.height;
+                } else {
+                    runBounds.size.height = backgroundHeight;
+                }
 
                 CGFloat xOffset = 0.0f;
                 CFRange glyphRange = CTRunGetStringRange((__bridge CTRunRef)glyphRun);
@@ -950,14 +995,22 @@ static inline CGSize CTFramesetterSuggestFrameSizeForAttributedStringWithConstra
                         xOffset = CTLineGetOffsetForStringIndex((__bridge CTLineRef)line, glyphRange.location, NULL);
                         break;
                 }
-
+                
                 runBounds.origin.x = origins[lineIndex].x + rect.origin.x + xOffset - fillPadding.left - rect.origin.x;
-                runBounds.origin.y = origins[lineIndex].y + rect.origin.y - fillPadding.bottom - rect.origin.y;
-                runBounds.origin.y -= runDescent;
-
-                // Don't draw higlightedLinkBackground too far to the right
-                if (CGRectGetWidth(runBounds) > width) {
-                    runBounds.size.width = width;
+                if (backgroundOriginY == 0.) {
+                    runBounds.origin.y = origins[lineIndex].y + rect.origin.y - fillPadding.bottom - rect.origin.y;
+                    runBounds.origin.y -= runDescent;
+                    
+                    runBounds.origin.y += baseLineOffset;
+                    
+                    backgroundOriginY = runBounds.origin.y;
+                } else {
+                    runBounds.origin.y = backgroundOriginY;
+                }
+                
+                // Don't draw higlightedLinkBackground too far to the right (but filling padding can extend line)
+                if (CGRectGetWidth(runBounds) > width + fillPadding.left + fillPadding.right) {
+                    runBounds.size.width = width + fillPadding.left + fillPadding.right;
                 }
 
                 CGPathRef path = [[UIBezierPath bezierPathWithRoundedRect:CGRectInset(UIEdgeInsetsInsetRect(runBounds, self.linkBackgroundEdgeInset), lineWidth, lineWidth) cornerRadius:cornerRadius] CGPath];
